@@ -1,0 +1,10 @@
+sudo docker build -t videosearchapi .
+
+sudo docker run -e PYTHONUNBUFFERED=1 --gpus all --privileged   -p 5801:5800   -v $(pwd)/new_dir2:/work_dir   videosearchapi   --batch_size 64   --working_dir /work_dir
+
+
+
+docker export -o videosearchapi.tar videosearchapi
+sudo chown gyrus14:gyrus14 videosearchapi.tar 
+
+docker import videosearchapi.tar videosearchapi

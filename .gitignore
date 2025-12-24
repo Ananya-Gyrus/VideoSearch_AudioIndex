@@ -1,0 +1,8 @@
+cache_dir/
+work_dir/
+new_dir2
+data/
+__pycache__/
+*.pyc
+*.pkl
+.DS_Store
