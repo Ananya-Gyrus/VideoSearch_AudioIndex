@@ -77,12 +77,13 @@ def save_index(index_path, index):
         return False
 
 def check_licence_validation():
-    try:
+    # try:
         global EXPIRYDATE, RECENT_DATE, LICENCE_KEY_FILE, OFFLINE_LICENSE_LIMIT_HOURS
         # print("Checking licence key...", LICENCE_KEY_FILE)
         if os.path.exists(LICENCE_KEY_FILE):
             dec_data = decrypt_file(LICENCE_KEY_FILE, PASSWORD).decode()
             dec_data = dec_data.split("\n")
+            print(dec_data)
             EXPIRYDATE = datetime.fromisoformat(dec_data[1].strip())
             OFFLINE_LICENSE_LIMIT_HOURS = float(dec_data[2])
             RECENT_DATE = datetime.fromisoformat(dec_data[3])
@@ -109,9 +110,9 @@ def check_licence_validation():
             print("No licence key file found. Please generate a new key.")
             return 0
         
-    except Exception as e:
-        print(f"Error checking licence validation")
-        return 0
+    # except Exception as e:
+    #     print(f"Error checking licence validation")
+    #     return 0
 
 def get_remaining_credit():
     global OFFLINE_LICENSE_LIMIT_HOURS
@@ -900,7 +901,13 @@ def run_indexing_process(video_files, sourceIds, video_fps_list, use_audio_list,
         indexing_status['total_scenes'] = len(scenes)
         indexing_status["overall_total_scenes"] += len(scenes)
         if use_audio:
-            index_audio_and_text(video_path, source_id, is_video, db_name, video_fps)
+            # batch size optional — will default to 8 if omitted
+            index_audio_only(
+                audio_path=video_path,
+                source_id=source_id,
+                db_name=db_name,
+                batch_size=BATCH_SIZE if 'BATCH_SIZE' in globals() else 4
+            )
         # Get existing metadata for this video from DB
         existing_metadata = db_manager.get_metadata_by_source_id_and_type(source_id, "video", db_name)
         # print(existing_metadata)
@@ -1875,13 +1882,8 @@ def index_audio_only(audio_path, source_id, db_name, batch_size=8):
     max_chunk_indexed = db_manager.get_max_chunk_indexed(source_id, db_name)
 
     # --- Helper: extract & split audio into chunks ---
-    def extract_audio_chunks(audio_path, chunk_duration=10, overlap_seconds=5):
-        """
-        Split long audio into overlapping chunks using ffmpeg.
-        Example: chunk_duration=10, overlap_seconds=5 =>
-        0-10, 5-15, 10-20, 15-25, ...
-        """
-        import tempfile, subprocess, math, os
+    def extract_audio_chunks(audio_path, chunk_duration=10, overlap_seconds=2):
+        import tempfile, subprocess, os, shutil
 
         temp_dir = tempfile.mkdtemp()
         try:
@@ -1895,22 +1897,20 @@ def index_audio_only(audio_path, source_id, db_name, batch_size=8):
             result = subprocess.run(probe_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             duration_str = result.stdout.decode().strip()
             if not duration_str:
-                return [], 0
+                return [], 0, []
             total_duration = float(duration_str)
 
-            # Overlap logic
             step = chunk_duration - overlap_seconds
             if step <= 0:
                 raise ValueError("overlap_seconds must be smaller than chunk_duration")
 
             audio_chunks = []
+            chunk_windows = []
             i = 0
             start_time = 0.0
 
-            # Generate overlapping windows
             while start_time < total_duration:
                 end_time = min(start_time + chunk_duration, total_duration)
-
                 out_chunk = os.path.join(temp_dir, f"chunk_{i:04d}.wav")
                 cmd = [
                     "ffmpeg", "-y",
@@ -1921,37 +1921,41 @@ def index_audio_only(audio_path, source_id, db_name, batch_size=8):
                     "-f", "wav", "-acodec", "pcm_s16le",
                     out_chunk
                 ]
-
                 subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
 
                 if os.path.exists(out_chunk):
                     audio_chunks.append(out_chunk)
+                    chunk_windows.append((start_time, end_time))
 
                 i += 1
-                start_time += step  # <-- THIS is the overlap
+                start_time += step
 
-            return audio_chunks, total_duration
+            return audio_chunks, total_duration, chunk_windows
 
         except Exception as e:
             print(f"Error extracting audio chunks: {e}")
-            return [], 0
-
+            return [], 0, []
 
     # --- Extract audio chunks ---
     chunk_duration = 10
-    audio_chunks, total_duration = extract_audio_chunks(audio_path, chunk_duration)
-    print("DEBUG chunk count =", len(audio_chunks))
+    overlap_seconds = 2
+    audio_chunks, total_duration, chunk_windows = extract_audio_chunks(
+        audio_path, chunk_duration, overlap_seconds
+    )
 
-    print(f" Extracted {len(audio_chunks)} chunks from {audio_path} ({total_duration:.2f}s)")
+    print("DEBUG chunk count =", len(audio_chunks))
+    print(f"Extracted {len(audio_chunks)} chunks from {audio_path} ({total_duration:.2f}s)")
 
     AUDIO_BATCH_SIZE = batch_size
     indexing_status["total_scenes"] += len(audio_chunks)
     indexing_status["overall_total_scenes"] += len(audio_chunks)
-    duration_in_hours = chunk_duration / 3600.0
+    step = chunk_duration - overlap_seconds
+    duration_in_hours = step / 3600.0
 
     # --- Batch accumulation ---
     current_audio_batch = []
     current_metadata_batch = []
+    all_indexed_ids = []
 
     for i, chunk_path in enumerate(audio_chunks):
         if i <= max_chunk_indexed:
@@ -1965,7 +1969,8 @@ def index_audio_only(audio_path, source_id, db_name, batch_size=8):
                 print(f"Skipping empty chunk {chunk_path}")
                 continue
 
-            current_audio_batch.append(audio_bytes)
+            start_time, end_time = chunk_windows[i]
+
             meta = {
                 "source_id": str(source_id),
                 "chunk_index": i,
@@ -1974,9 +1979,11 @@ def index_audio_only(audio_path, source_id, db_name, batch_size=8):
                 "audio_path_relative": os.path.relpath(audio_path, os.path.dirname(OUTPUT_DIR)),
                 "embedding_filename": f"{db_name}_{source_id}_chunk_{i:04d}.aud",
                 "total_chunks": len(audio_chunks),
-                "start_time_sec": i * chunk_duration,
-                "end_time_sec": min((i + 1) * chunk_duration, total_duration)
+                "start_time_sec": start_time,
+                "end_time_sec": end_time
             }
+
+            current_audio_batch.append(audio_bytes)
             current_metadata_batch.append(meta)
 
             # --- Process batch ---
@@ -1993,13 +2000,13 @@ def index_audio_only(audio_path, source_id, db_name, batch_size=8):
                 ids = np.arange(current_idx, current_idx + len(emb_np), dtype='int64')
                 audio_index.add_with_ids(emb_np, ids)
 
-                # Assign FAISS IDs + store metadata
                 for j, meta in enumerate(current_metadata_batch):
                     meta["faiss_id"] = current_idx + j
+                    all_indexed_ids.append(current_idx + j)
+
                 db_manager.insert_metadata_batch(current_metadata_batch, db_name)
                 save_index(index_files["audio"], audio_index)
 
-                # Reset for next batch
                 current_audio_batch, current_metadata_batch = [], []
 
             indexing_status["scenes_processed"] += 1
@@ -2018,8 +2025,11 @@ def index_audio_only(audio_path, source_id, db_name, batch_size=8):
             current_idx = audio_index.ntotal
             ids = np.arange(current_idx, current_idx + len(emb_np), dtype='int64')
             audio_index.add_with_ids(emb_np, ids)
+
             for j, meta in enumerate(current_metadata_batch):
                 meta["faiss_id"] = current_idx + j
+                all_indexed_ids.append(current_idx + j)
+
             db_manager.insert_metadata_batch(current_metadata_batch, db_name)
             save_index(index_files["audio"], audio_index)
 
@@ -2028,10 +2038,16 @@ def index_audio_only(audio_path, source_id, db_name, batch_size=8):
         "audio_file": audio_path,
         "total_chunks": len(audio_chunks),
         "db_name": db_name,
-        "indexed_ids": [m.get("faiss_id") for m in current_metadata_batch if "faiss_id" in m]
+        "indexed_ids": all_indexed_ids
     }
     debug_json = os.path.join(debug_dir, f"{audio_name}_audio_debug.json")
     json.dump(debug_log, open(debug_json, "w"), indent=4)
+
+    # --- Cleanup ---
+    try:
+        shutil.rmtree(os.path.dirname(audio_chunks[0]))
+    except Exception:
+        pass
 
     del model
     print(f"Finished audio indexing for {audio_path}")

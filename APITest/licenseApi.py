@@ -11,6 +11,7 @@ licence_resp = requests.post(licence_url)
 print("Licence Requirement:", licence_resp.json())
 
 
+
 """{
     "licensestatus": {
         "User Key": "hardware specific key",

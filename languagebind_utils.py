@@ -5,7 +5,7 @@ from LanguageBind.languagebind import LanguageBind, to_device, transform_dict, L
 import whisper
 
 # Load once globally
-WHISPER_MODEL = whisper.load_model("large-v3")
+WHISPER_MODEL = whisper.load_model("medium")
 
 
 # LanguageBind model singleton
